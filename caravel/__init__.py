@@ -107,9 +107,10 @@ def load_user_from_request(request):
             api_key = base64.b64decode(api_key)
         except TypeError:
             pass
-        user = db.session().query(User).filter_by(username=api_key).first()
-        if user:
-            return user
+        if api_key == app.config.get("AUTH_ADMIN_API_KEY"):
+            user = db.session().query(User).filter_by(username='admin').first()
+            if user:
+                return user
 
     # finally, return None if both methods did not login the user
     return None
