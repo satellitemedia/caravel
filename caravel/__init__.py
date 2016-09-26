@@ -4,6 +4,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import base64
 import logging
 import os
 from logging.handlers import TimedRotatingFileHandler
@@ -12,6 +13,7 @@ from flask import Flask, redirect
 from flask_appbuilder import SQLA, AppBuilder, IndexView
 from sqlalchemy import event, exc
 from flask_appbuilder.baseviews import expose
+from flask_appbuilder.security.sqla.models import User
 from flask_cache import Cache
 from flask_migrate import Migrate
 from caravel.source_registry import SourceRegistry
@@ -95,6 +97,23 @@ appbuilder = AppBuilder(
     security_manager_class=app.config.get("CUSTOM_SECURITY_MANAGER"))
 
 sm = appbuilder.sm
+
+def load_user_from_request(request):
+    api_key = request.headers.get('Authorization')
+    if api_key:
+        if api_key.startswith('Proxy '):
+            api_key= api_key.replace('Proxy ', '', 1)
+        try:
+            api_key = base64.b64decode(api_key)
+        except TypeError:
+            pass
+        user = db.session().query(User).filter_by(username=api_key).first()
+        if user:
+            return user
+
+    # finally, return None if both methods did not login the user
+    return None
+sm.lm.request_loader(load_user_from_request)
 
 get_session = appbuilder.get_session
 
