@@ -241,8 +241,6 @@ class BaseViz(object):
         )
         from_dttm = utils.parse_human_datetime(since)
         now = datetime.now()
-        if from_dttm > now:
-            from_dttm = now - (from_dttm - now)
         until = extra_filters.get('__to') or form_data.get("until", "now")
         to_dttm = utils.parse_human_datetime(until)
         if from_dttm > to_dttm:
