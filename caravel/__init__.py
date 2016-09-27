@@ -105,10 +105,11 @@ def load_user_from_request(request):
             api_key= api_key.replace('Proxy ', '', 1)
         try:
             api_key = base64.b64decode(api_key)
+            key_parts = api_key.split()
         except TypeError:
             pass
-        if api_key == app.config.get("AUTH_ADMIN_API_KEY"):
-            user = db.session().query(User).filter_by(username='admin').first()
+        if key_parts[1] == app.config.get("AUTH_ADMIN_API_KEY"):
+            user = db.session().query(User).filter_by(username=key_parts[0]).first()
             if user:
                 return user
 
