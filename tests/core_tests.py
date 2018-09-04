@@ -1,58 +1,137 @@
-"""Unit tests for Caravel"""
+# -*- coding: utf-8 -*-
+"""Unit tests for Superset"""
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
 import csv
+import datetime
 import doctest
-import imp
-import json
 import io
+import json
+import logging
+import os
 import random
+import re
+import string
 import unittest
 
+import pandas as pd
+import psycopg2
+from six import text_type
+import sqlalchemy as sqla
 
-from flask import escape
-from flask_appbuilder.security.sqla import models as ab_models
+from superset import dataframe, db, jinja_context, security_manager, sql_lab, utils
+from superset.connectors.sqla.models import SqlaTable
+from superset.db_engine_specs import BaseEngineSpec
+from superset.models import core as models
+from superset.models.sql_lab import Query
+from superset.views.core import DatabaseView
+from .base_tests import SupersetTestCase
 
-import caravel
-from caravel import app, db, models, utils, appbuilder, sm
-from caravel.source_registry import SourceRegistry
-from caravel.models import DruidDatasource
 
-from .base_tests import CaravelTestCase
+class CoreTests(SupersetTestCase):
 
-BASE_DIR = app.config.get("BASE_DIR")
-cli = imp.load_source('cli', BASE_DIR + "/bin/caravel")
-
-class CoreTests(CaravelTestCase):
+    requires_examples = True
 
     def __init__(self, *args, **kwargs):
-        # Load examples first, so that we setup proper permission-view
-        # relations for all example data sources.
         super(CoreTests, self).__init__(*args, **kwargs)
 
     @classmethod
     def setUpClass(cls):
-        cli.load_examples(load_test_data=True)
-        utils.init(caravel)
         cls.table_ids = {tbl.table_name: tbl.id for tbl in (
             db.session
-            .query(models.SqlaTable)
+            .query(SqlaTable)
             .all()
         )}
 
     def setUp(self):
-        db.session.query(models.Query).delete()
+        db.session.query(Query).delete()
         db.session.query(models.DatasourceAccessRequest).delete()
+        db.session.query(models.Log).delete()
 
     def tearDown(self):
-        pass
+        db.session.query(Query).delete()
+
+    def test_login(self):
+        resp = self.get_resp(
+            '/login/',
+            data=dict(username='admin', password='general'))
+        self.assertNotIn('User confirmation needed', resp)
+
+        resp = self.get_resp('/logout/', follow_redirects=True)
+        self.assertIn('User confirmation needed', resp)
+
+        resp = self.get_resp(
+            '/login/',
+            data=dict(username='admin', password='wrongPassword'))
+        self.assertIn('User confirmation needed', resp)
+
+    def test_slice_endpoint(self):
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+        resp = self.get_resp('/superset/slice/{}/'.format(slc.id))
+        assert 'Time Column' in resp
+        assert 'List Roles' in resp
+
+        # Testing overrides
+        resp = self.get_resp(
+            '/superset/slice/{}/?standalone=true'.format(slc.id))
+        assert 'List Roles' not in resp
+
+    def test_cache_key(self):
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+
+        viz = slc.viz
+        qobj = viz.query_obj()
+        cache_key = viz.cache_key(qobj)
+        self.assertEqual(cache_key, viz.cache_key(qobj))
+
+        qobj['groupby'] = []
+        self.assertNotEqual(cache_key, viz.cache_key(qobj))
+
+    def test_old_slice_json_endpoint(self):
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+
+        json_endpoint = (
+            '/superset/explore_json/{}/{}/'
+            .format(slc.datasource_type, slc.datasource_id)
+        )
+        resp = self.get_resp(json_endpoint, {'form_data': json.dumps(slc.viz.form_data)})
+        assert '"Jennifer"' in resp
+
+    def test_slice_json_endpoint(self):
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+        resp = self.get_resp(slc.explore_json_url)
+        assert '"Jennifer"' in resp
+
+    def test_old_slice_csv_endpoint(self):
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+
+        csv_endpoint = (
+            '/superset/explore_json/{}/{}/?csv=true'
+            .format(slc.datasource_type, slc.datasource_id)
+        )
+        resp = self.get_resp(csv_endpoint, {'form_data': json.dumps(slc.viz.form_data)})
+        assert 'Jennifer,' in resp
+
+    def test_slice_csv_endpoint(self):
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+
+        csv_endpoint = '/superset/explore_json/?csv=true'
+        resp = self.get_resp(
+            csv_endpoint, {'form_data': json.dumps({'slice_id': slc.id})})
+        assert 'Jennifer,' in resp
 
     def test_admin_only_permissions(self):
         def assert_admin_permission_in(role_name, assert_func):
-            role = sm.find_role(role_name)
+            role = security_manager.find_role(role_name)
             permissions = [p.permission.name for p in role.permissions]
             assert_func('can_sync_druid_source', permissions)
             assert_func('can_approve', permissions)
@@ -63,7 +142,7 @@ class CoreTests(CaravelTestCase):
 
     def test_admin_only_menu_views(self):
         def assert_admin_view_menus_in(role_name, assert_func):
-            role = sm.find_role(role_name)
+            role = security_manager.find_role(role_name)
             view_menus = [p.view_menu.name for p in role.permissions]
             assert_func('ResetPasswordView', view_menus)
             assert_func('RoleModelView', view_menus)
@@ -71,7 +150,6 @@ class CoreTests(CaravelTestCase):
             assert_func('UserDBModelView', view_menus)
             assert_func('SQL Lab',
                         view_menus)
-            assert_func('AccessRequestsModelView', view_menus)
 
         assert_admin_view_menus_in('Admin', self.assertIn)
         assert_admin_view_menus_in('Alpha', self.assertNotIn)
@@ -79,31 +157,86 @@ class CoreTests(CaravelTestCase):
 
     def test_save_slice(self):
         self.login(username='admin')
-
-        slc = (
-            db.session.query(models.Slice.id)
-            .filter_by(slice_name="Energy Sankey")
-            .first())
-        slice_id = slc.id
-
-        copy_name = "Test Sankey Save"
-        tbl_id = self.table_ids.get('energy_usage')
-        url = (
-            "/caravel/explore/table/{}/?viz_type=sankey&groupby=source&"
-            "groupby=target&metric=sum__value&row_limit=5000&where=&having=&"
-            "flt_col_0=source&flt_op_0=in&flt_eq_0=&slice_id={}&slice_name={}&"
-            "collapsed_fieldsets=&action={}&datasource_name=energy_usage&"
-            "datasource_id=1&datasource_type=table&previous_viz_type=sankey")
-
+        slice_name = 'Energy Sankey'
+        slice_id = self.get_slice(slice_name, db.session).id
         db.session.commit()
-        resp = self.client.get(
-            url.format(tbl_id, slice_id, copy_name, 'save'),
-            follow_redirects=True)
-        assert copy_name in resp.data.decode('utf-8')
-        resp = self.client.get(
-            url.format(tbl_id, slice_id, copy_name, 'overwrite'),
-            follow_redirects=True)
-        assert 'Energy' in resp.data.decode('utf-8')
+        copy_name = 'Test Sankey Save'
+        tbl_id = self.table_ids.get('energy_usage')
+        new_slice_name = 'Test Sankey Overwirte'
+
+        url = (
+            '/superset/explore/table/{}/?slice_name={}&'
+            'action={}&datasource_name=energy_usage')
+
+        form_data = {
+            'viz_type': 'sankey',
+            'groupby': 'target',
+            'metric': 'sum__value',
+            'row_limit': 5000,
+            'slice_id': slice_id,
+        }
+        # Changing name and save as a new slice
+        self.get_resp(
+            url.format(
+                tbl_id,
+                copy_name,
+                'saveas',
+            ),
+            {'form_data': json.dumps(form_data)},
+        )
+        slices = db.session.query(models.Slice) \
+            .filter_by(slice_name=copy_name).all()
+        assert len(slices) == 1
+        new_slice_id = slices[0].id
+
+        form_data = {
+            'viz_type': 'sankey',
+            'groupby': 'source',
+            'metric': 'sum__value',
+            'row_limit': 5000,
+            'slice_id': new_slice_id,
+            'time_range': 'now',
+        }
+        # Setting the name back to its original name by overwriting new slice
+        self.get_resp(
+            url.format(
+                tbl_id,
+                new_slice_name,
+                'overwrite',
+            ),
+            {'form_data': json.dumps(form_data)},
+        )
+        slc = db.session.query(models.Slice).filter_by(id=new_slice_id).first()
+        assert slc.slice_name == new_slice_name
+        assert slc.viz.form_data == form_data
+        db.session.delete(slc)
+
+    def test_filter_endpoint(self):
+        self.login(username='admin')
+        slice_name = 'Energy Sankey'
+        slice_id = self.get_slice(slice_name, db.session).id
+        db.session.commit()
+        tbl_id = self.table_ids.get('energy_usage')
+        table = db.session.query(SqlaTable).filter(SqlaTable.id == tbl_id)
+        table.filter_select_enabled = True
+        url = (
+            '/superset/filter/table/{}/target/?viz_type=sankey&groupby=source'
+            '&metric=sum__value&flt_col_0=source&flt_op_0=in&flt_eq_0=&'
+            'slice_id={}&datasource_name=energy_usage&'
+            'datasource_id=1&datasource_type=table')
+
+        # Changing name
+        resp = self.get_resp(url.format(tbl_id, slice_id))
+        assert len(resp) > 0
+        assert 'Carbon Dioxide' in resp
+
+    def test_slice_data(self):
+        # slice data should have some required attributes
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+        slc_data_attributes = slc.data.keys()
+        assert('changed_on' in slc_data_attributes)
+        assert('modified' in slc_data_attributes)
 
     def test_slices(self):
         # Testing by hitting the two supported end points for all slices
@@ -112,639 +245,456 @@ class CoreTests(CaravelTestCase):
         urls = []
         for slc in db.session.query(Slc).all():
             urls += [
-                (slc.slice_name, 'slice_url', slc.slice_url),
-                (slc.slice_name, 'json_endpoint', slc.viz.json_endpoint),
-                (slc.slice_name, 'csv_endpoint', slc.viz.csv_endpoint),
-                (slc.slice_name, 'slice_id_url',
-                    "/caravel/{slc.datasource_type}/{slc.datasource_id}/{slc.id}/".format(slc=slc)),
+                (slc.slice_name, 'explore', slc.slice_url),
+                (slc.slice_name, 'explore_json', slc.explore_json_url),
             ]
         for name, method, url in urls:
-            print("[{name}]/[{method}]: {url}".format(**locals()))
+            logging.info('[{name}]/[{method}]: {url}'.format(**locals()))
             self.client.get(url)
 
-    def test_dashboard(self):
+    def test_tablemodelview_list(self):
         self.login(username='admin')
-        urls = {}
-        for dash in db.session.query(models.Dashboard).all():
-            urls[dash.dashboard_title] = dash.url
-        for title, url in urls.items():
-            assert escape(title) in self.client.get(url).data.decode('utf-8')
+
+        url = '/tablemodelview/list/'
+        resp = self.get_resp(url)
+
+        # assert that a table is listed
+        table = db.session.query(SqlaTable).first()
+        assert table.name in resp
+        assert '/superset/explore/table/{}'.format(table.id) in resp
+
+    def test_add_slice(self):
+        self.login(username='admin')
+        # assert that /chart/add responds with 200
+        url = '/chart/add'
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_get_user_slices(self):
+        self.login(username='admin')
+        userid = security_manager.find_user('admin').id
+        url = '/sliceaddview/api/read?_flt_0_created_by={}'.format(userid)
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_slices_V2(self):
+        # Add explore-v2-beta role to admin user
+        # Test all slice urls as user with with explore-v2-beta role
+        security_manager.add_role('explore-v2-beta')
+
+        security_manager.add_user(
+            'explore_beta', 'explore_beta', ' user', 'explore_beta@airbnb.com',
+            security_manager.find_role('explore-v2-beta'),
+            password='general')
+        self.login(username='explore_beta', password='general')
+
+        Slc = models.Slice
+        urls = []
+        for slc in db.session.query(Slc).all():
+            urls += [
+                (slc.slice_name, 'slice_url', slc.slice_url),
+            ]
+        for name, method, url in urls:
+            print('[{name}]/[{method}]: {url}'.format(**locals()))
+            response = self.client.get(url)
 
     def test_doctests(self):
-        modules = [utils, models]
+        modules = [utils, models, sql_lab]
         for mod in modules:
             failed, tests = doctest.testmod(mod)
             if failed:
-                raise Exception("Failed a doctest")
+                raise Exception('Failed a doctest')
 
     def test_misc(self):
-        assert self.client.get('/health').data.decode('utf-8') == "OK"
-        assert self.client.get('/ping').data.decode('utf-8') == "OK"
+        assert self.get_resp('/health') == 'OK'
+        assert self.get_resp('/healthcheck') == 'OK'
+        assert self.get_resp('/ping') == 'OK'
 
-    def test_testconn(self):
-        database = (
-            db.session
-            .query(models.Database)
-            .filter_by(database_name='main')
-            .first()
-        )
+    def test_testconn(self, username='admin'):
+        self.login(username=username)
+        database = self.get_main_database(db.session)
 
         # validate that the endpoint works with the password-masked sqlalchemy uri
         data = json.dumps({
             'uri': database.safe_sqlalchemy_uri(),
-            'name': 'main'
+            'name': 'main',
+            'impersonate_user': False,
         })
-        response = self.client.post('/caravel/testconn', data=data, content_type='application/json')
+        response = self.client.post(
+            '/superset/testconn',
+            data=data,
+            content_type='application/json')
         assert response.status_code == 200
+        assert response.headers['Content-Type'] == 'application/json'
 
         # validate that the endpoint works with the decrypted sqlalchemy uri
         data = json.dumps({
             'uri': database.sqlalchemy_uri_decrypted,
-            'name': 'main'
+            'name': 'main',
+            'impersonate_user': False,
         })
-        response = self.client.post('/caravel/testconn', data=data, content_type='application/json')
+        response = self.client.post(
+            '/superset/testconn',
+            data=data,
+            content_type='application/json')
         assert response.status_code == 200
+        assert response.headers['Content-Type'] == 'application/json'
 
+    def test_custom_password_store(self):
+        database = self.get_main_database(db.session)
+        conn_pre = sqla.engine.url.make_url(database.sqlalchemy_uri_decrypted)
+
+        def custom_password_store(uri):
+            return 'password_store_test'
+
+        models.custom_password_store = custom_password_store
+        conn = sqla.engine.url.make_url(database.sqlalchemy_uri_decrypted)
+        if conn_pre.password:
+            assert conn.password == 'password_store_test'
+            assert conn.password != conn_pre.password
+        # Disable for password store for later tests
+        models.custom_password_store = None
+
+    def test_databaseview_edit(self, username='admin'):
+        # validate that sending a password-masked uri does not over-write the decrypted
+        # uri
+        self.login(username=username)
+        database = self.get_main_database(db.session)
+        sqlalchemy_uri_decrypted = database.sqlalchemy_uri_decrypted
+        url = 'databaseview/edit/{}'.format(database.id)
+        data = {k: database.__getattribute__(k) for k in DatabaseView.add_columns}
+        data['sqlalchemy_uri'] = database.safe_sqlalchemy_uri()
+        self.client.post(url, data=data)
+        database = self.get_main_database(db.session)
+        self.assertEqual(sqlalchemy_uri_decrypted, database.sqlalchemy_uri_decrypted)
 
     def test_warm_up_cache(self):
-        slice = db.session.query(models.Slice).first()
-        resp = self.client.get(
-            '/caravel/warm_up_cache?slice_id={}'.format(slice.id),
-            follow_redirects=True)
-        data = json.loads(resp.data.decode('utf-8'))
-        assert data == [{'slice_id': slice.id, 'slice_name': slice.slice_name}]
+        slc = self.get_slice('Girls', db.session)
+        data = self.get_json_resp(
+            '/superset/warm_up_cache?slice_id={}'.format(slc.id))
+        assert data == [{'slice_id': slc.id, 'slice_name': slc.slice_name}]
 
-        resp = self.client.get(
-            '/caravel/warm_up_cache?table_name=energy_usage&db_name=main',
-            follow_redirects=True)
-        data = json.loads(resp.data.decode('utf-8'))
-        assert len(data) == 3
+        data = self.get_json_resp(
+            '/superset/warm_up_cache?table_name=energy_usage&db_name=main')
+        assert len(data) == 4
 
     def test_shortner(self):
         self.login(username='admin')
         data = (
-            "//caravel/explore/table/1/?viz_type=sankey&groupby=source&"
-            "groupby=target&metric=sum__value&row_limit=5000&where=&having=&"
-            "flt_col_0=source&flt_op_0=in&flt_eq_0=&slice_id=78&slice_name="
-            "Energy+Sankey&collapsed_fieldsets=&action=&datasource_name="
-            "energy_usage&datasource_id=1&datasource_type=table&"
-            "previous_viz_type=sankey"
+            '//superset/explore/table/1/?viz_type=sankey&groupby=source&'
+            'groupby=target&metric=sum__value&row_limit=5000&where=&having=&'
+            'flt_col_0=source&flt_op_0=in&flt_eq_0=&slice_id=78&slice_name='
+            'Energy+Sankey&collapsed_fieldsets=&action=&datasource_name='
+            'energy_usage&datasource_id=1&datasource_type=table&'
+            'previous_viz_type=sankey'
         )
-        resp = self.client.post('/r/shortner/', data=data)
-        assert '/r/' in resp.data.decode('utf-8')
+        resp = self.client.post('/r/shortner/', data=dict(data=data))
+        assert re.search(r'\/r\/[0-9]+', resp.data.decode('utf-8'))
 
-    def test_save_dash(self, username='admin'):
-        self.login(username=username)
-        dash = db.session.query(models.Dashboard).filter_by(
-            slug="births").first()
-        positions = []
-        for i, slc in enumerate(dash.slices):
-            d = {
-                'col': 0,
-                'row': i * 4,
-                'size_x': 4,
-                'size_y': 4,
-                'slice_id': '{}'.format(slc.id)}
-            positions.append(d)
-        data = {
-            'css': '',
-            'expanded_slices': {},
-            'positions': positions,
-        }
-        url = '/caravel/save_dash/{}/'.format(dash.id)
-        resp = self.client.post(url, data=dict(data=json.dumps(data)))
-        assert "SUCCESS" in resp.data.decode('utf-8')
+    def test_kv(self):
+        self.logout()
+        self.login(username='admin')
 
-    def test_add_slices(self, username='admin'):
-        self.login(username=username)
-        dash = db.session.query(models.Dashboard).filter_by(
-            slug="births").first()
-        new_slice = db.session.query(models.Slice).filter_by(
-            slice_name="Mapbox Long/Lat").first()
-        existing_slice = db.session.query(models.Slice).filter_by(
-            slice_name="Name Cloud").first()
-        data = {
-            "slice_ids": [new_slice.data["slice_id"],
-                          existing_slice.data["slice_id"]]
-        }
-        url = '/caravel/add_slices/{}/'.format(dash.id)
-        resp = self.client.post(url, data=dict(data=json.dumps(data)))
-        assert "SLICES ADDED" in resp.data.decode('utf-8')
+        try:
+            resp = self.client.post('/kv/store/', data=dict())
+        except Exception:
+            self.assertRaises(TypeError)
 
-        dash = db.session.query(models.Dashboard).filter_by(
-            slug="births").first()
-        new_slice = db.session.query(models.Slice).filter_by(
-            slice_name="Mapbox Long/Lat").first()
-        assert new_slice in dash.slices
-        assert len(set(dash.slices)) == len(dash.slices)
+        value = json.dumps({'data': 'this is a test'})
+        resp = self.client.post('/kv/store/', data=dict(data=value))
+        self.assertEqual(resp.status_code, 200)
+        kv = db.session.query(models.KeyValue).first()
+        kv_value = kv.value
+        self.assertEqual(json.loads(value), json.loads(kv_value))
 
-    def test_approve(self):
-        session = db.session
-        sm.add_role('table_role')
-        self.login('admin')
-
-        def prepare_request(ds_type, ds_name, role):
-            ds_class = SourceRegistry.sources[ds_type]
-            # TODO: generalize datasource names
-            if ds_type == 'table':
-                ds = session.query(ds_class).filter(
-                    ds_class.table_name == ds_name).first()
-            else:
-                ds = session.query(ds_class).filter(
-                    ds_class.datasource_name == ds_name).first()
-            ds_perm_view = sm.find_permission_view_menu(
-                'datasource_access', ds.perm)
-            sm.add_permission_role(sm.find_role(role), ds_perm_view)
-            access_request = models.DatasourceAccessRequest(
-                datasource_id=ds.id,
-                datasource_type=ds_type,
-                created_by_fk=sm.find_user(username='gamma').id,
-            )
-            session.add(access_request)
-            session.commit()
-            return access_request
-
-        EXTEND_ROLE_REQUEST = (
-            '/caravel/approve?datasource_type={}&datasource_id={}&'
-            'created_by={}&role_to_extend={}')
-        GRANT_ROLE_REQUEST = (
-            '/caravel/approve?datasource_type={}&datasource_id={}&'
-            'created_by={}&role_to_grant={}')
-
-        # Case 1. Grant new role to the user.
-
-        access_request1 = prepare_request(
-            'table', 'unicode_test', 'table_role')
-        ds_1_id = access_request1.datasource_id
-        self.client.get(GRANT_ROLE_REQUEST.format(
-            'table', ds_1_id, 'gamma', 'table_role'))
-        access_requests = self.get_access_requests('gamma', 'table', ds_1_id)
-        # request was removed
-        self.assertFalse(access_requests)
-        # user was granted table_role
-        user_roles = [r.name for r in sm.find_user('gamma').roles]
-        self.assertIn('table_role', user_roles)
-
-        # Case 2. Extend the role to have access to the table
-
-        access_request2 = prepare_request('table', 'long_lat', 'table_role')
-        ds_2_id = access_request2.datasource_id
-        long_lat_perm = access_request2.datasource.perm
-
-        self.client.get(EXTEND_ROLE_REQUEST.format(
-            'table', access_request2.datasource_id, 'gamma', 'table_role'))
-        access_requests = self.get_access_requests('gamma', 'table', ds_2_id)
-        # request was removed
-        self.assertFalse(access_requests)
-        # table_role was extended to grant access to the long_lat table/
-        table_role = sm.find_role('table_role')
-        perm_view = sm.find_permission_view_menu(
-            'datasource_access', long_lat_perm)
-        self.assertIn(perm_view, table_role.permissions)
-
-        # Case 3. Grant new role to the user to access the druid datasource.
-
-        sm.add_role('druid_role')
-        access_request3 = prepare_request('druid', 'druid_ds_1', 'druid_role')
-        self.client.get(GRANT_ROLE_REQUEST.format(
-            'druid', access_request3.datasource_id, 'gamma', 'druid_role'))
-
-        # user was granted table_role
-        user_roles = [r.name for r in sm.find_user('gamma').roles]
-        self.assertIn('druid_role', user_roles)
-
-        # Case 4. Extend the role to have access to the druid datasource
-
-        access_request4 = prepare_request('druid', 'druid_ds_2', 'druid_role')
-        druid_ds_2_perm = access_request4.datasource.perm
-
-        self.client.get(EXTEND_ROLE_REQUEST.format(
-            'druid', access_request4.datasource_id, 'gamma', 'druid_role'))
-        # druid_role was extended to grant access to the druid_access_ds_2
-        druid_role = sm.find_role('druid_role')
-        perm_view = sm.find_permission_view_menu(
-            'datasource_access', druid_ds_2_perm)
-        self.assertIn(perm_view, druid_role.permissions)
-
-        # cleanup
-        gamma_user = sm.find_user(username='gamma')
-        gamma_user.roles.remove(sm.find_role('druid_role'))
-        gamma_user.roles.remove(sm.find_role('table_role'))
-        session.delete(sm.find_role('druid_role'))
-        session.delete(sm.find_role('table_role'))
-        session.commit()
-
-    def test_request_access(self):
-        session = db.session
-        self.login(username='gamma')
-        gamma_user = sm.find_user(username='gamma')
-        sm.add_role('dummy_role')
-        gamma_user.roles.append(sm.find_role('dummy_role'))
-        session.commit()
-
-        ACCESS_REQUEST = (
-            '/caravel/request_access?datasource_type={}&datasource_id={}')
-        ROLE_EXTEND_LINK = (
-            '<a href="/caravel/approve?datasource_type={}&datasource_id={}&'
-            'created_by={}&role_to_extend={}">Extend {} Role</a>')
-        ROLE_GRANT_LINK = (
-            '<a href="/caravel/approve?datasource_type={}&datasource_id={}&'
-            'created_by={}&role_to_grant={}">Grant {} Role</a>')
-
-        # Case 1. Request table access, there are no roles have this table.
-
-        table1 = session.query(models.SqlaTable).filter_by(
-            table_name='random_time_series').first()
-        table_1_id = table1.id
-
-        # request access to the table
-        self.client.get(ACCESS_REQUEST.format('table', table_1_id))
-
-        access_request1 = self.get_access_requests(
-            'gamma', 'table', table_1_id)[0]
-        approve_link_1 = ROLE_EXTEND_LINK.format(
-            'table', table_1_id, 'gamma', 'dummy_role', 'dummy_role')
+        resp = self.client.get('/kv/{}/'.format(kv.id))
+        self.assertEqual(resp.status_code, 200)
         self.assertEqual(
-            access_request1.user_roles,
-            '<ul><li>Gamma Role</li><li>{}</li></ul>'.format(approve_link_1))
-        self.assertEqual(access_request1.roles_with_datasource, '<ul></ul>')
+            json.loads(value),
+            json.loads(resp.data.decode('utf-8')))
 
-        # Case 2. Duplicate request.
-
-        self.client.get(ACCESS_REQUEST.format('table', table_1_id))
-        access_requests_2 = self.get_access_requests(
-            'gamma', 'table', table_1_id)
-        self.assertEqual(len(access_requests_2), 1)
-
-        # Case 3. Request access, roles exist that contains the table.
-
-        # add table to the existing roles
-        table3 = session.query(models.SqlaTable).filter_by(
-            table_name='energy_usage').first()
-        table_3_id = table3.id
-        table3_perm = table3.perm
-
-        sm.add_role('energy_usage_role')
-        alpha_role = sm.find_role('Alpha')
-        sm.add_permission_role(
-            alpha_role,
-            sm.find_permission_view_menu('datasource_access', table3_perm))
-        sm.add_permission_role(
-            sm.find_role("energy_usage_role"),
-            sm.find_permission_view_menu('datasource_access', table3_perm))
-        session.commit()
-
-        self.client.get(ACCESS_REQUEST.format('table', table_3_id))
-
-        access_request3 = self.get_access_requests(
-            'gamma', 'table', table_3_id)[0]
-        approve_link_3 = ROLE_GRANT_LINK.format(
-            'table', table_3_id, 'gamma', 'energy_usage_role',
-            'energy_usage_role')
-        self.assertEqual(access_request3.roles_with_datasource,
-                         '<ul><li>{}</li></ul>'.format(approve_link_3))
-
-        # Case 4. Request druid access, there are no roles have this table.
-        druid_ds_4 = session.query(models.DruidDatasource).filter_by(
-            datasource_name='druid_ds_1').first()
-        druid_ds_4_id = druid_ds_4.id
-
-        # request access to the table
-        self.client.get(ACCESS_REQUEST.format('druid', druid_ds_4_id))
-        access_request4 = self.get_access_requests(
-            'gamma', 'druid', druid_ds_4_id)[0]
-        approve_link_4 = ROLE_EXTEND_LINK.format(
-            'druid', druid_ds_4_id, 'gamma', 'dummy_role', 'dummy_role')
-        self.assertEqual(
-            access_request4.user_roles,
-            '<ul><li>Gamma Role</li><li>{}</li></ul>'.format(approve_link_4))
-
-        self.assertEqual(
-            access_request4.roles_with_datasource,
-            '<ul></ul>'.format(access_request4.id))
-
-        # Case 5. Roles exist that contains the druid datasource.
-        # add druid ds to the existing roles
-        druid_ds_5 = session.query(models.DruidDatasource).filter_by(
-            datasource_name='druid_ds_2').first()
-        druid_ds_5_id = druid_ds_5.id
-        druid_ds_5_perm = druid_ds_5.perm
-
-        druid_ds_2_role = sm.add_role('druid_ds_2_role')
-        admin_role = sm.find_role('Admin')
-        sm.add_permission_role(
-            admin_role,
-            sm.find_permission_view_menu('datasource_access', druid_ds_5_perm))
-        sm.add_permission_role(
-            druid_ds_2_role,
-            sm.find_permission_view_menu('datasource_access', druid_ds_5_perm))
-        session.commit()
-
-        self.client.get(ACCESS_REQUEST.format('druid', druid_ds_5_id))
-        access_request5 = self.get_access_requests(
-            'gamma', 'druid', druid_ds_5_id)[0]
-        approve_link_5 = ROLE_GRANT_LINK.format(
-            'druid', druid_ds_5_id, 'gamma', 'druid_ds_2_role',
-            'druid_ds_2_role')
-
-        self.assertEqual(access_request5.roles_with_datasource,
-                         '<ul><li>{}</li></ul>'.format(approve_link_5))
-
-        # cleanup
-        gamma_user = sm.find_user(username='gamma')
-        gamma_user.roles.remove(sm.find_role('dummy_role'))
-        session.commit()
-
-    def test_druid_sync_from_config(self):
-        self.login()
-        cluster = models.DruidCluster(cluster_name="new_druid")
-        db.session.add(cluster)
-        db.session.commit()
-
-        cfg = {
-            "user": "admin",
-            "cluster": "new_druid",
-            "config": {
-                "name": "test_click",
-                "dimensions": ["affiliate_id", "campaign", "first_seen"],
-                "metrics_spec": [{"type": "count", "name": "count"},
-                                 {"type": "sum", "name": "sum"}],
-                "batch_ingestion": {
-                    "sql": "SELECT * FROM clicks WHERE d='{{ ds }}'",
-                    "ts_column": "d",
-                    "sources": [{
-                        "table": "clicks",
-                        "partition": "d='{{ ds }}'"
-                    }]
-                }
-            }
-        }
-        resp = self.client.post('/caravel/sync_druid/', data=json.dumps(cfg))
-
-        druid_ds = db.session.query(DruidDatasource).filter_by(
-            datasource_name="test_click").first()
-        assert set([c.column_name for c in druid_ds.columns]) == set(
-            ["affiliate_id", "campaign", "first_seen"])
-        assert set([m.metric_name for m in druid_ds.metrics]) == set(
-            ["count", "sum"])
-        assert resp.status_code == 201
-
-        # datasource exists, not changes required
-        resp = self.client.post('/caravel/sync_druid/', data=json.dumps(cfg))
-        druid_ds = db.session.query(DruidDatasource).filter_by(
-            datasource_name="test_click").first()
-        assert set([c.column_name for c in druid_ds.columns]) == set(
-            ["affiliate_id", "campaign", "first_seen"])
-        assert set([m.metric_name for m in druid_ds.metrics]) == set(
-            ["count", "sum"])
-        assert resp.status_code == 201
-
-        # datasource exists, add new metrics and dimentions
-        cfg = {
-            "user": "admin",
-            "cluster": "new_druid",
-            "config": {
-                "name": "test_click",
-                "dimensions": ["affiliate_id", "second_seen"],
-                "metrics_spec": [
-                    {"type": "bla", "name": "sum"},
-                    {"type": "unique", "name": "unique"}
-                ],
-            }
-        }
-        resp = self.client.post('/caravel/sync_druid/', data=json.dumps(cfg))
-        druid_ds = db.session.query(DruidDatasource).filter_by(
-            datasource_name="test_click").first()
-        # columns and metrics are not deleted if config is changed as
-        # user could define his own dimensions / metrics and want to keep them
-        assert set([c.column_name for c in druid_ds.columns]) == set(
-            ["affiliate_id", "campaign", "first_seen", "second_seen"])
-        assert set([m.metric_name for m in druid_ds.metrics]) == set(
-            ["count", "sum", "unique"])
-        # metric type will not be overridden, sum stays instead of bla
-        assert set([m.metric_type for m in druid_ds.metrics]) == set(
-            ["longSum", "sum", "unique"])
-        assert resp.status_code == 201
-
-    def test_filter_druid_datasource(self):
-        gamma_ds = DruidDatasource(
-            datasource_name="datasource_for_gamma",
-        )
-        db.session.add(gamma_ds)
-        no_gamma_ds = DruidDatasource(
-            datasource_name="datasource_not_for_gamma",
-        )
-        db.session.add(no_gamma_ds)
-        db.session.commit()
-        utils.merge_perm(sm, 'datasource_access', gamma_ds.perm)
-        utils.merge_perm(sm, 'datasource_access', no_gamma_ds.perm)
-        db.session.commit()
-
-        gamma_ds_permission_view = (
-            db.session.query(ab_models.PermissionView)
-            .join(ab_models.ViewMenu)
-            .filter(ab_models.ViewMenu.name == gamma_ds.perm)
-            .first()
-        )
-        sm.add_permission_role(sm.find_role('Gamma'), gamma_ds_permission_view)
-
-        self.login(username='gamma')
-        url = '/druiddatasourcemodelview/list/'
-        resp = self.client.get(url, follow_redirects=True)
-        assert 'datasource_for_gamma' in resp.data.decode('utf-8')
-        assert 'datasource_not_for_gamma' not in resp.data.decode('utf-8')
-
-    def test_add_filter(self, username='admin'):
-        # navigate to energy_usage slice with "Electricity,heat" in filter values
-        data = (
-            "/caravel/explore/table/1/?viz_type=table&groupby=source&metric=count&flt_col_1=source&flt_op_1=in&flt_eq_1=%27Electricity%2Cheat%27"
-            "&userid=1&datasource_name=energy_usage&datasource_id=1&datasource_type=tablerdo_save=saveas")
-        resp = self.client.get(
-            data,
-            follow_redirects=True)
-        assert ("source" in resp.data.decode('utf-8'))
+        try:
+            resp = self.client.get('/kv/10001/')
+        except Exception:
+            self.assertRaises(TypeError)
 
     def test_gamma(self):
         self.login(username='gamma')
-        resp = self.client.get('/slicemodelview/list/')
-        assert "List Slice" in resp.data.decode('utf-8')
-
-        resp = self.client.get('/dashboardmodelview/list/')
-        assert "List Dashboard" in resp.data.decode('utf-8')
-
-    def run_sql(self, sql, user_name, client_id='not_used'):
-        self.login(username=user_name)
-        dbid = (
-            db.session.query(models.Database)
-            .filter_by(database_name='main')
-            .first().id
-        )
-        resp = self.client.post(
-            '/caravel/sql_json/',
-            data=dict(database_id=dbid, sql=sql, select_as_create_as=False, client_id=client_id),
-        )
-        self.logout()
-        return json.loads(resp.data.decode('utf-8'))
-
-    def test_sql_json(self):
-        data = self.run_sql('SELECT * FROM ab_user', 'admin')
-        assert len(data['data']) > 0
-
-        data = self.run_sql('SELECT * FROM unexistant_table', 'admin')
-        assert len(data['error']) > 0
-
-    def test_sql_json_has_access(self):
-        main_db = (
-            db.session.query(models.Database).filter_by(database_name="main").first()
-        )
-        utils.merge_perm(sm, 'database_access', main_db.perm)
-        db.session.commit()
-        main_db_permission_view = (
-            db.session.query(ab_models.PermissionView)
-            .join(ab_models.ViewMenu)
-            .filter(ab_models.ViewMenu.name == '[main].(id:1)')
-            .first()
-        )
-        astronaut = sm.add_role("Astronaut")
-        sm.add_permission_role(astronaut, main_db_permission_view)
-        # Astronaut role is Gamma + main db permissions
-        for gamma_perm in sm.find_role('Gamma').permissions:
-            sm.add_permission_role(astronaut, gamma_perm)
-
-        gagarin = appbuilder.sm.find_user('gagarin')
-        if not gagarin:
-            appbuilder.sm.add_user(
-                'gagarin', 'Iurii', 'Gagarin', 'gagarin@cosmos.ussr',
-                appbuilder.sm.find_role('Astronaut'),
-                password='general')
-        data = self.run_sql('SELECT * FROM ab_user', 'gagarin')
-        db.session.query(models.Query).delete()
-        db.session.commit()
-        assert len(data['data']) > 0
+        assert 'List Charts' in self.get_resp('/chart/list/')
+        assert 'List Dashboard' in self.get_resp('/dashboard/list/')
 
     def test_csv_endpoint(self):
+        self.login('admin')
         sql = """
             SELECT first_name, last_name
             FROM ab_user
             WHERE first_name='admin'
         """
-        client_id = "{}".format(random.getrandbits(64))[:10]
-        self.run_sql(sql, 'admin', client_id)
+        client_id = '{}'.format(random.getrandbits(64))[:10]
+        self.run_sql(sql, client_id, raise_on_error=True)
 
-        self.login('admin')
-        resp = self.client.get('/caravel/csv/{}'.format(client_id))
-        data = csv.reader(io.StringIO(resp.data.decode('utf-8')))
+        resp = self.get_resp('/superset/csv/{}'.format(client_id))
+        data = csv.reader(io.StringIO(resp))
         expected_data = csv.reader(
-            io.StringIO("first_name,last_name\nadmin, user\n"))
+            io.StringIO('first_name,last_name\nadmin, user\n'))
+
+        sql = "SELECT first_name FROM ab_user WHERE first_name LIKE '%admin%'"
+        client_id = '{}'.format(random.getrandbits(64))[:10]
+        self.run_sql(sql, client_id, raise_on_error=True)
+
+        resp = self.get_resp('/superset/csv/{}'.format(client_id))
+        data = csv.reader(io.StringIO(resp))
+        expected_data = csv.reader(
+            io.StringIO('first_name\nadmin\n'))
 
         self.assertEqual(list(expected_data), list(data))
         self.logout()
 
-    def test_queries_endpoint(self):
-        resp = self.client.get('/caravel/queries/{}'.format(0))
-        self.assertEquals(403, resp.status_code)
-
+    def test_extra_table_metadata(self):
         self.login('admin')
-        resp = self.client.get('/caravel/queries/{}'.format(0))
-        data = json.loads(resp.data.decode('utf-8'))
-        self.assertEquals(0, len(data))
-        self.logout()
+        dbid = self.get_main_database(db.session).id
+        self.get_json_resp(
+            '/superset/extra_table_metadata/{dbid}/'
+            'ab_permission_view/panoramix/'.format(**locals()))
 
-        self.run_sql("SELECT * FROM ab_user", 'admin', client_id='client_id_1')
-        self.run_sql("SELECT * FROM ab_user1", 'admin', client_id='client_id_2')
+    def test_process_template(self):
+        maindb = self.get_main_database(db.session)
+        sql = "SELECT '{{ datetime(2017, 1, 1).isoformat() }}'"
+        tp = jinja_context.get_template_processor(database=maindb)
+        rendered = tp.process_template(sql)
+        self.assertEqual("SELECT '2017-01-01T00:00:00'", rendered)
+
+    def test_get_template_kwarg(self):
+        maindb = self.get_main_database(db.session)
+        s = '{{ foo }}'
+        tp = jinja_context.get_template_processor(database=maindb, foo='bar')
+        rendered = tp.process_template(s)
+        self.assertEqual('bar', rendered)
+
+    def test_template_kwarg(self):
+        maindb = self.get_main_database(db.session)
+        s = '{{ foo }}'
+        tp = jinja_context.get_template_processor(database=maindb)
+        rendered = tp.process_template(s, foo='bar')
+        self.assertEqual('bar', rendered)
+
+    def test_templated_sql_json(self):
         self.login('admin')
-        resp = self.client.get('/caravel/queries/{}'.format(0))
-        data = json.loads(resp.data.decode('utf-8'))
-        self.assertEquals(2, len(data))
+        sql = "SELECT '{{ datetime(2017, 1, 1).isoformat() }}' as test"
+        data = self.run_sql(sql, 'fdaklj3ws')
+        self.assertEqual(data['data'][0]['test'], '2017-01-01T00:00:00')
 
-        query = db.session.query(models.Query).filter_by(
-            sql='SELECT * FROM ab_user').first()
-        query.changed_on = utils.EPOCH
-        db.session.commit()
+    def test_table_metadata(self):
+        maindb = self.get_main_database(db.session)
+        backend = maindb.backend
+        data = self.get_json_resp(
+            '/superset/table/{}/ab_user/null/'.format(maindb.id))
+        self.assertEqual(data['name'], 'ab_user')
+        assert len(data['columns']) > 5
+        assert data.get('selectStar').startswith('SELECT')
 
-        resp = self.client.get('/caravel/queries/{}'.format(123456000))
-        data = json.loads(resp.data.decode('utf-8'))
-        self.assertEquals(1, len(data))
+        # Engine specific tests
+        if backend in ('mysql', 'postgresql'):
+            self.assertEqual(data.get('primaryKey').get('type'), 'pk')
+            self.assertEqual(
+                data.get('primaryKey').get('column_names')[0], 'id')
+            self.assertEqual(len(data.get('foreignKeys')), 2)
+            if backend == 'mysql':
+                self.assertEqual(len(data.get('indexes')), 7)
+            elif backend == 'postgresql':
+                self.assertEqual(len(data.get('indexes')), 5)
 
-        self.logout()
-        resp = self.client.get('/caravel/queries/{}'.format(0))
-        self.assertEquals(403, resp.status_code)
-
-    def test_search_query_endpoint(self):
-        userId = 'userId=null'
-        databaseId = 'databaseId=null'
-        searchText = 'searchText=null'
-        status = 'status=success'
-        params = [userId, databaseId, searchText, status]
-        resp = self.client.get('/caravel/search_queries?'+'&'.join(params))
-        self.assertEquals(200, resp.status_code)
-
-    def test_public_user_dashboard_access(self):
-        # Try access before adding appropriate permissions.
-        self.revoke_public_access('birth_names')
-        self.logout()
-
-        resp = self.client.get('/slicemodelview/list/')
-        data = resp.data.decode('utf-8')
-
-        assert 'birth_names</a>' not in data
-
-        resp = self.client.get('/dashboardmodelview/list/')
-        data = resp.data.decode('utf-8')
-        assert '/caravel/dashboard/births/' not in data
-
-        self.setup_public_access_for_dashboard('birth_names')
-
-        # Try access after adding appropriate permissions.
-        resp = self.client.get('/slicemodelview/list/')
-        data = resp.data.decode('utf-8')
-        assert 'birth_names' in data
-
-        resp = self.client.get('/dashboardmodelview/list/')
-        data = resp.data.decode('utf-8')
-        assert "/caravel/dashboard/births/" in data
-
-        resp = self.client.get('/caravel/dashboard/births/')
-        data = resp.data.decode('utf-8')
-        assert 'Births' in data
-
-        # Confirm that public doesn't have access to other datasets.
-        resp = self.client.get('/slicemodelview/list/')
-        data = resp.data.decode('utf-8')
-        assert 'wb_health_population</a>' not in data
-
-        resp = self.client.get('/dashboardmodelview/list/')
-        data = resp.data.decode('utf-8')
-        assert "/caravel/dashboard/world_health/" not in data
-
-    def test_only_owners_can_save(self):
-        dash = (
-            db.session
-            .query(models.Dashboard)
-            .filter_by(slug="births")
-            .first()
+    def test_fetch_datasource_metadata(self):
+        self.login(username='admin')
+        url = (
+            '/superset/fetch_datasource_metadata?' +
+            'datasourceKey=1__table'
         )
-        dash.owners = []
-        db.session.merge(dash)
-        db.session.commit()
-        self.test_save_dash('admin')
+        resp = self.get_json_resp(url)
+        keys = [
+            'name', 'filterable_cols', 'gb_cols', 'type', 'all_cols',
+            'order_by_choices', 'metrics_combo', 'granularity_sqla',
+            'time_grain_sqla', 'id',
+        ]
+        for k in keys:
+            self.assertIn(k, resp.keys())
 
-        self.logout()
-        self.assertRaises(
-            AssertionError, self.test_save_dash, 'alpha')
+    def test_user_profile(self, username='admin'):
+        self.login(username=username)
+        slc = self.get_slice('Girls', db.session)
 
-        alpha = appbuilder.sm.find_user('alpha')
+        # Setting some faves
+        url = '/superset/favstar/Slice/{}/select/'.format(slc.id)
+        resp = self.get_json_resp(url)
+        self.assertEqual(resp['count'], 1)
 
         dash = (
             db.session
             .query(models.Dashboard)
-            .filter_by(slug="births")
+            .filter_by(slug='births')
             .first()
         )
-        dash.owners = [alpha]
-        db.session.merge(dash)
-        db.session.commit()
-        self.test_save_dash('alpha')
+        url = '/superset/favstar/Dashboard/{}/select/'.format(dash.id)
+        resp = self.get_json_resp(url)
+        self.assertEqual(resp['count'], 1)
+
+        userid = security_manager.find_user('admin').id
+        resp = self.get_resp('/superset/profile/admin/')
+        self.assertIn('"app"', resp)
+        data = self.get_json_resp('/superset/recent_activity/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp('/superset/created_slices/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp('/superset/created_dashboards/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp('/superset/fave_slices/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp('/superset/fave_dashboards/{}/'.format(userid))
+        self.assertNotIn('message', data)
+        data = self.get_json_resp(
+            '/superset/fave_dashboards_by_username/{}/'.format(username))
+        self.assertNotIn('message', data)
+
+    def test_slice_id_is_always_logged_correctly_on_web_request(self):
+        # superset/explore case
+        slc = db.session.query(models.Slice).filter_by(slice_name='Girls').one()
+        qry = db.session.query(models.Log).filter_by(slice_id=slc.id)
+        self.get_resp(slc.slice_url, {'form_data': json.dumps(slc.form_data)})
+        self.assertEqual(1, qry.count())
+
+    def test_slice_id_is_always_logged_correctly_on_ajax_request(self):
+        # superset/explore_json case
+        self.login(username='admin')
+        slc = db.session.query(models.Slice).filter_by(slice_name='Girls').one()
+        qry = db.session.query(models.Log).filter_by(slice_id=slc.id)
+        slc_url = slc.slice_url.replace('explore', 'explore_json')
+        self.get_json_resp(slc_url, {'form_data': json.dumps(slc.form_data)})
+        self.assertEqual(1, qry.count())
+
+    def test_slice_query_endpoint(self):
+        # API endpoint for query string
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+        resp = self.get_resp('/superset/slice_query/{}/'.format(slc.id))
+        assert 'query' in resp
+        assert 'language' in resp
+        self.logout()
+
+    def test_viz_get_fillna_for_columns(self):
+        slc = self.get_slice('Girls', db.session)
+        q = slc.viz.query_obj()
+        results = slc.viz.datasource.query(q)
+        fillna_columns = slc.viz.get_fillna_for_columns(results.df.columns)
+        self.assertDictEqual(
+            fillna_columns,
+            {'name': ' NULL', 'sum__num': 0},
+        )
+
+    def test_import_csv(self):
+        self.login(username='admin')
+        filename = 'testCSV.csv'
+        table_name = ''.join(
+            random.choice(string.ascii_uppercase) for _ in range(5))
+
+        test_file = open(filename, 'w+')
+        test_file.write('a,b\n')
+        test_file.write('john,1\n')
+        test_file.write('paul,2\n')
+        test_file.close()
+        main_db_uri = (
+            db.session.query(models.Database)
+            .filter_by(database_name='main')
+            .all()
+        )
+
+        test_file = open(filename, 'rb')
+        form_data = {
+            'csv_file': test_file,
+            'sep': ',',
+            'name': table_name,
+            'con': main_db_uri[0].id,
+            'if_exists': 'append',
+            'index_label': 'test_label',
+            'mangle_dupe_cols': False,
+        }
+        url = '/databaseview/list/'
+        add_datasource_page = self.get_resp(url)
+        assert 'Upload a CSV' in add_datasource_page
+
+        url = '/csvtodatabaseview/form'
+        form_get = self.get_resp(url)
+        assert 'CSV to Database configuration' in form_get
+
+        try:
+            # ensure uploaded successfully
+            form_post = self.get_resp(url, data=form_data)
+            assert 'CSV file \"testCSV.csv\" uploaded to table' in form_post
+        finally:
+            os.remove(filename)
+
+    def test_dataframe_timezone(self):
+        tz = psycopg2.tz.FixedOffsetTimezone(offset=60, name=None)
+        data = [
+            (datetime.datetime(2017, 11, 18, 21, 53, 0, 219225, tzinfo=tz),),
+            (datetime.datetime(2017, 11, 18, 22, 6, 30, 61810, tzinfo=tz),),
+        ]
+        df = dataframe.SupersetDataFrame(list(data), [['data']], BaseEngineSpec)
+        data = df.data
+        self.assertDictEqual(
+            data[0],
+            {'data': pd.Timestamp('2017-11-18 21:53:00.219225+0100', tz=tz)},
+        )
+        self.assertDictEqual(
+            data[1],
+            {'data': pd.Timestamp('2017-11-18 22:06:30.061810+0100', tz=tz)},
+        )
+
+    def test_comments_in_sqlatable_query(self):
+        clean_query = "SELECT '/* val 1 */' as c1, '-- val 2' as c2 FROM tbl"
+        commented_query = '/* comment 1 */' + clean_query + '-- comment 2'
+        table = SqlaTable(sql=commented_query)
+        rendered_query = text_type(table.get_from_clause())
+        self.assertEqual(clean_query, rendered_query)
+
+    def test_slice_payload_no_data(self):
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+        json_endpoint = '/superset/explore_json/'
+        form_data = slc.form_data
+        form_data.update({
+            'filters': [{'col': 'state', 'op': 'in', 'val': ['N/A']}],
+        })
+
+        data = self.get_json_resp(
+            json_endpoint,
+            {'form_data': json.dumps(form_data)},
+        )
+        self.assertEqual(data['status'], utils.QueryStatus.SUCCESS)
+        self.assertEqual(data['error'], 'No data')
+
+    def test_slice_payload_invalid_query(self):
+        self.login(username='admin')
+        slc = self.get_slice('Girls', db.session)
+        form_data = slc.form_data
+        form_data.update({
+            'groupby': ['N/A'],
+        })
+
+        data = self.get_json_resp(
+            '/superset/explore_json/',
+            {'form_data': json.dumps(form_data)},
+        )
+        self.assertEqual(data['status'], utils.QueryStatus.FAILED)
+        assert 'KeyError' in data['stacktrace']
+
+    def test_slice_payload_viz_markdown(self):
+        self.login(username='admin')
+        slc = self.get_slice('Title', db.session)
+
+        url = slc.get_explore_url(base_url='/superset/explore_json')
+        data = self.get_json_resp(url)
+        self.assertEqual(data['status'], None)
+        self.assertEqual(data['error'], None)
 
 
 if __name__ == '__main__':

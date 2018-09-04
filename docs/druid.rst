@@ -1,21 +1,19 @@
 Druid
 =====
 
-Caravel works well with Druid, though currently not all
-advanced features out of Druid are covered. This page clarifies what is
-covered and what isn't and explains how to use some of the features.
+Superset has a native connector to Druid, and a majority of Druid's
+features are accessible through Superset.
 
 .. note ::
-    Currently Airbnb runs against Druid ``0.8.x`` and previous /
-    following versions are not tested against.
-
-Supported
-'''''''''
+    Druid now supports SQL and can be accessed through Superset's
+    SQLAlchemy connector. The long term vision is to deprecate
+    the Druid native REST connector and query Druid exclusively through
+    the SQL interface.
 
 Aggregations
 ------------
 
-Common aggregations, or Druid metrics can be defined and used in Caravel.
+Common aggregations, or Druid metrics can be defined and used in Superset.
 The first and simpler use case is to use the checkbox matrix expose in your
 datasource's edit view (``Sources -> Druid Datasources ->
 [your datasource] -> Edit -> [tab] List Druid Column``).
@@ -28,21 +26,22 @@ element correspond to Druid aggregation definition. You can create your own
 aggregations manually from the ``List Druid Metric`` tab following Druid
 documentation.
 
-.. image:: _static/img/druid_agg.png
+.. image:: images/druid_agg.png
    :scale: 50 %
 
 Post-Aggregations
 -----------------
 
-Druid supports post aggregation and this works in Caravel. All you have to
+Druid supports post aggregation and this works in Superset. All you have to
 do is creating a metric, much like you would create an aggregation manually,
 but specify ``postagg`` as a ``Metric Type``. You then have to provide a valid
 json post-aggregation definition (as specified in the Druid docs) in the
 Json field.
 
 
-Not yet supported
-'''''''''''''''''
+Unsupported Features
+--------------------
 
-- Regex filters
-- Lookups / joins
+.. note ::
+    Unclear at this point, this section of the documentation could use
+    some input.
