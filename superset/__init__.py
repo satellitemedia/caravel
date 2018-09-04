@@ -6,6 +6,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+import base64
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
@@ -14,6 +15,7 @@ import os
 from flask import Flask, redirect
 from flask_appbuilder import AppBuilder, IndexView, SQLA
 from flask_appbuilder.baseviews import expose
+from flask_appbuilder.security.sqla.models import User
 from flask_compress import Compress
 from flask_migrate import Migrate
 from flask_wtf.csrf import CSRFProtect
@@ -184,6 +186,29 @@ appbuilder = AppBuilder(
 )
 
 security_manager = appbuilder.sm
+
+
+def load_user_from_request(request):
+    api_key = request.headers.get('Authorization')
+    if api_key:
+        key_parts = []
+        if api_key.startswith('Proxy '):
+            api_key= api_key.replace('Proxy ', '', 1)
+        try:
+            api_key = base64.b64decode(api_key)
+            key_parts = api_key.split()
+        except TypeError:
+            pass
+        if key_parts[1] == app.config.get("AUTH_ADMIN_API_KEY"):
+            user = db.session().query(User).filter_by(username=key_parts[0]).first()
+            if user:
+                return user
+
+    # finally, return None if both methods did not login the user
+    return None
+
+
+security_manager.lm.request_loader(load_user_from_request)
 
 results_backend = app.config.get('RESULTS_BACKEND')
 
